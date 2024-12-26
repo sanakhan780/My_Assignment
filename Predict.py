@@ -1,102 +1,57 @@
-import argparse
-import numpy as np
-import os
 import torch
-import torch.nn as nn
-from torch.utils import data
-import torch.backends.cudnn as cudnn
-from utils.tools import *
-from dataset.landslide_dataset import LandslideDataSet
-from model.Networks import unet
-import h5py
+import cv2
+import numpy as np
+from Networks import build_advanced_segformer
+from landslide_dataset import preprocess_image
 
-name_classes = ['Non-Landslide','Landslide']
-epsilon = 1e-14
+# Settings
+model_path = "best_model.pth"
+input_channels = 14
+num_classes = 5
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def importName(modulename, name):
-    """ Import a named object from a module in the context of this function.
-    """
-    try:
-        module = __import__(modulename, globals(), locals(  ), [name])
-    except ImportError:
-        return None
-    return vars(module)[name]
+# Load model
+model = build_advanced_segformer(num_classes=num_classes, num_input_channels=input_channels).to(device)
+model.load_state_dict(torch.load(model_path))
+model.eval()
 
-def get_arguments():
-
-    parser = argparse.ArgumentParser(description="Baseline method for Land4Seen")
+def predict(image_path):
+    image = preprocess_image(image_path, input_channels=input_channels).to(device)
+    with torch.no_grad():
+        output = model(image.unsqueeze(0))  # Add batch dimension
+        prediction = torch.argmax(output, dim=1).squeeze().cpu().numpy()
     
-    parser.add_argument("--data_dir", type=str, default='/scratch/Land4Sense_Competition_h5/',
-                        help="dataset path.")
-    parser.add_argument("--model_module", type =str, default='model.Networks',
-                        help='model module to import')
-    parser.add_argument("--model_name", type=str, default='unet',
-                        help='modle name in given module')
-    parser.add_argument("--test_list", type=str, default='./dataset/test.txt',
-                        help="test list file.")
-    parser.add_argument("--input_size", type=str, default='128,128',
-                        help="width and height of input images.")                     
-    parser.add_argument("--num_classes", type=int, default=2,
-                        help="number of classes.")               
-    parser.add_argument("--num_workers", type=int, default=0,
-                        help="number of workers for multithread dataloading.")
-    parser.add_argument("--gpu_id", type=int, default=0,
-                        help="gpu id in the training.")
-    parser.add_argument("--snapshot_dir", type=str, default='./test_map/',
-                        help="where to save predicted maps.")
-    parser.add_argument("--restore_from", type=str, default='./exp/batch3500_F1_7396.pth',
-                        help="trained model.")
+    return prediction
 
-    return parser.parse_args()
+def visualize_predictions(image_path, mask_path):
+    original_image = cv2.imread(image_path)  # Load original image for visualization
+    predicted_mask = predict(image_path)
 
+    # Create color map for visualization (modify as needed for your classes)
+    color_map = {
+        0: (0, 0, 0),      # Background (black)
+        1: (255, 0, 0),    # Class 1 (red)
+        2: (0, 255, 0),    # Class 2 (green)
+        # Add more classes as needed...
+    }
 
-def main():
-    args = get_arguments()
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
-    snapshot_dir = args.snapshot_dir
-    if os.path.exists(snapshot_dir)==False:
-        os.makedirs(snapshot_dir)
-
-    w, h = map(int, args.input_size.split(','))
-    input_size = (w, h)
-
-    cudnn.enabled = True
-    cudnn.benchmark = True
+    vis_mask = np.zeros((*predicted_mask.shape, 3), dtype=np.uint8)
     
-    # Create network   
-    model = unet(n_classes=args.num_classes)
-   
-    saved_state_dict = torch.load(args.restore_from)  
-    model.load_state_dict(saved_state_dict)
+    for class_id in color_map:
+        vis_mask[predicted_mask == class_id] = color_map[class_id]
 
-    model = model.cuda()
+    # Overlay predicted mask on original image for visualization
+    overlayed_image = cv2.addWeighted(original_image, 0.6, vis_mask, 0.4, 0)
 
-    test_loader = data.DataLoader(
-                    LandslideDataSet(args.data_dir, args.test_list, set='unlabeled'),
-                    batch_size=1, shuffle=False, num_workers=args.num_workers, pin_memory=True)
-
-
-    interp = nn.Upsample(size=(input_size[1], input_size[0]), mode='bilinear')
+    cv2.imshow('Original Image', original_image)
+    cv2.imshow('Predicted Mask', vis_mask)
+    cv2.imshow('Overlayed Image', overlayed_image)
     
+    cv2.waitKey(0) 
+    cv2.destroyAllWindows()
 
-    print('Testing..........')
-    model.eval()
-   
-
-    for index, batch in enumerate(test_loader):  
-        image, _, name = batch
-        image = image.float().cuda()
-        name = name[0].split('.')[0].split('/')[-1].replace('image','mask')
-        print(index+1, '/', len(test_loader), ': Testing ', name)  
-        
-        with torch.no_grad():
-            pred = model(image)
-
-        _,pred = torch.max(interp(nn.functional.softmax(pred,dim=1)).detach(), 1)
-        pred = pred.squeeze().data.cpu().numpy().astype('uint8')         
-        with h5py.File(snapshot_dir+name+'.h5','w') as hf:
-            hf.create_dataset('mask', data=pred)
-
- 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    test_image_path = 'TestData/img/image_1.h5'   # Change this to your HDF5 file path.
+    test_mask_path = 'TestData/mask/mask_1.h5'     # Change this to your mask file path.
+    
+    visualize_predictions(test_image_path, test_mask_path)
